@@ -125,7 +125,7 @@ Each engine's guide (linked in the table above) covers protocol tradeoffs, secur
 
 **Benchmark**: TCP and ICMP probes against the peer, with a real-throughput number if `iperf3 -s` happens to be running there.
 
-**Smart defaults**: every prompt that has a sensible default shows it — last-used values (transport, remote address, peer IP), detected values (public IPv4/IPv6, network interface, free ports), or computed recommendations (a free port that doesn't collide with another tunnel *or* an already-listening process on the system).
+**Smart defaults**: every prompt that has a sensible default shows it — last-used values (transport, remote address, peer IP), detected values (public IPv4/IPv6, network interface, free ports), or computed recommendations (a free port that doesn't collide with another tunnel *or* an already-listening process on the system). IPX uses the IPv4 source selected by the kernel's default route, verifies that it is actually assigned to the chosen interface, and therefore does not silently select a slow secondary address on multi-IP servers.
 
 ## Security
 
@@ -140,7 +140,7 @@ Backhaul editing snapshots the config + systemd unit under `/root/backhaul-core/
 
 ## Health monitoring
 
-A systemd timer (`backhaul-watchdog.timer`) runs every 5 minutes and restarts an inactive tunnel only when its unit is enabled. A deliberately disabled tunnel stays disabled. It also checks the shared TLS certificate and restarts only enabled dependents when replacement is genuinely required.
+A systemd timer (`backhaul-watchdog.timer`) runs every 30 seconds and restarts an inactive tunnel only when its unit is enabled. For TUN/IPX it restarts a live-looking but unusable service only after three consecutive full path failures, avoiding reconnect loops caused by one delayed probe. The heavier Tunnel Health/Smart Auto-MTU sample remains limited to once every five minutes. A deliberately disabled tunnel stays disabled. It also checks the shared TLS certificate and restarts only enabled dependents when replacement is genuinely required.
 
 ## Tunnel Health engine
 
@@ -168,14 +168,14 @@ State is stored per tunnel under `/root/backhaul-core/.auto-mtu/`. The tunnel de
 
 **Optimize Network** (menu item 11) tunes the underlying OS/kernel network stack — this is independent of, and complementary to, each engine's own tuning options (e.g. Backhaul's `so_rcvbuf`/`so_sndbuf`/`mss`/mux settings). It applies:
 
-- Socket buffers, backlog, and conntrack capacity sized in three RAM profiles; an administrator's already-higher values are never reduced.
-- BBR + `fq` as the default for newly created qdiscs when supported. Existing interface qdiscs are not replaced live.
+- Socket buffers, backlog, and conntrack capacity sized in three RAM profiles for sustained 800 Mbps-1 Gbps paths (including roughly 100 ms international RTT); an administrator's already-higher values are never reduced.
+- BBR + `fq` as the default qdisc when supported. Existing `fq` queues receive a persisted high-throughput profile: single-queue NICs use the tested large aggregate limits, while multi-queue NICs receive smaller per-queue limits. Custom and non-`fq` qdiscs are never replaced.
 - Existing `ip_local_reserved_ports` are merged with every detected TCP/UDP listener instead of overwritten.
 - A safer ephemeral range and conservative keepalive/MTU-probing settings. Riskier global `tcp_fastopen`, conntrack timeout/hashsize, PAM limits, and systemd-wide limits are left alone.
 
 Optimization is synchronized automatically before and after every successful tunnel create/edit. The pre-start pass makes new sockets inherit the selected congestion control; the post-start pass adds the newly listening ports to the reservation list. Menu item 11 remains available for status, a manual retry/re-apply, and rollback.
 
-The first apply records every touched sysctl value and the exact prior contents/existence of managed files in `/root/backhaul-core/.network-tune-state/`. Re-applying never overwrites that baseline and rebuilds reserved ports from the baseline plus current listeners, so removed tunnel ports do not accumulate. **Roll back** restores those values and manager-owned files, but refuses to overwrite a file that an administrator changed after optimization; shared `limits.conf` is never replaced wholesale. A partial rollback keeps its state for a safe retry. Successful rollback archives the snapshot under `.backups`; uninstall also invokes rollback.
+The first apply records every touched sysctl value, the active `fq` queue parameters, and the exact prior contents/existence of managed files in `/root/backhaul-core/.network-tune-state/`. Re-applying never overwrites that baseline and rebuilds reserved ports from the baseline plus current listeners, so removed tunnel ports do not accumulate. **Roll back** restores those values, queue parameters, and manager-owned files, but refuses to overwrite a file that an administrator changed after optimization; shared `limits.conf` is never replaced wholesale. A partial rollback keeps its state for a safe retry. Successful rollback archives the snapshot under `.backups`; uninstall also invokes rollback.
 
 ## Migrating to a new VPS
 

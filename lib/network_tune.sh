@@ -6,6 +6,7 @@
 NETTUNE_SYSCTL_CONF="/etc/sysctl.d/99-tunnel-vm.conf"
 NETTUNE_BBR_MODULE_CONF="/etc/modules-load.d/tunnel-vm-bbr.conf"
 NETTUNE_SYSTEMD_LIMIT_CONF="/etc/systemd/system.conf.d/99-tunnel-vm-nofile.conf"
+NETTUNE_QDISC_UNIT="/etc/systemd/system/tunnel-manager-qdisc.service"
 NETTUNE_LIMITS_CONF="/etc/security/limits.conf"
 NETTUNE_MEMINFO="/proc/meminfo"
 NETTUNE_CONNTRACK_PATH="/proc/sys/net/netfilter/nf_conntrack_max"
@@ -14,6 +15,7 @@ NETTUNE_STATE_DIR="${config_dir}/.network-tune-state"
 NETTUNE_VALUES_FILE="${NETTUNE_STATE_DIR}/sysctl-values.tsv"
 NETTUNE_LAST_BACKUP_FILE="${config_dir}/.network-tune-last-backup"
 NETTUNE_LOCK_FILE="${config_dir}/.network-tune.lock"
+NETTUNE_QDISC_VALUES_FILE="${NETTUNE_STATE_DIR}/fq-qdisc-values.tsv"
 NETTUNE_LAST_ERROR=""
 
 core_optimize_is_applied() {
@@ -98,17 +100,129 @@ net.ipv4.tcp_congestion_control
 EOF
 }
 
+nettune_fq_rows() {
+local interface="$1"
+tc qdisc show dev "$interface" 2>/dev/null | awk '
+$1 == "qdisc" && $2 == "fq" {
+scope=""
+limit=flow_limit=buckets=quantum=initial_quantum=""
+for (i=3; i<=NF; i++) {
+if ($i == "root") scope="root"
+else if ($i == "parent") scope=$(i+1)
+else if ($i == "limit") limit=$(i+1)
+else if ($i == "flow_limit") flow_limit=$(i+1)
+else if ($i == "buckets") buckets=$(i+1)
+else if ($i == "quantum") quantum=$(i+1)
+else if ($i == "initial_quantum") initial_quantum=$(i+1)
+}
+gsub(/[^0-9]/, "", limit); gsub(/[^0-9]/, "", flow_limit)
+gsub(/[^0-9]/, "", buckets); gsub(/[^0-9]/, "", quantum)
+gsub(/[^0-9]/, "", initial_quantum)
+if (scope != "" && limit != "" && flow_limit != "" && buckets != "" && quantum != "" && initial_quantum != "")
+printf "%s\t%s\t%s\t%s\t%s\t%s\n", scope, limit, flow_limit, buckets, quantum, initial_quantum
+}
+'
+}
+
+nettune_capture_fq_baseline() {
+local interface
+mkdir -p "$NETTUNE_STATE_DIR" || return 1
+: > "$NETTUNE_QDISC_VALUES_FILE"
+command -v tc >/dev/null 2>&1 || return 0
+interface=$(detect_default_interface)
+[[ -n "$interface" ]] || return 0
+while IFS=$'\t' read -r scope limit flow_limit buckets quantum initial_quantum; do
+[[ -n "$scope" ]] || continue
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$interface" "$scope" "$limit" "$flow_limit" "$buckets" "$quantum" "$initial_quantum" >> "$NETTUNE_QDISC_VALUES_FILE"
+done < <(nettune_fq_rows "$interface")
+}
+
+nettune_change_fq() {
+local interface="$1" scope="$2" limit="$3" flow_limit="$4" buckets="$5" quantum="$6" initial_quantum="$7"
+local -a location=(root)
+[[ "$scope" != "root" ]] && location=(parent "$scope")
+tc qdisc change dev "$interface" "${location[@]}" fq limit "$limit" flow_limit "$flow_limit" \
+buckets "$buckets" quantum "$quantum" initial_quantum "$initial_quantum"
+}
+
+nettune_apply_fq_profile() {
+[[ -s "$NETTUNE_QDISC_VALUES_FILE" ]] || return 0
+command -v tc >/dev/null 2>&1 || return 0
+local interface scope old_limit old_flow old_buckets old_quantum old_initial
+local target_limit target_flow target_buckets mtu quantum initial_quantum
+while IFS=$'\t' read -r interface scope old_limit old_flow old_buckets old_quantum old_initial; do
+[[ -n "$interface" && -n "$scope" ]] || continue
+: "$old_limit" "$old_flow" "$old_buckets" "$old_quantum" "$old_initial"
+mtu=$(cat "/sys/class/net/${interface}/mtu" 2>/dev/null || printf '1500')
+[[ "$mtu" =~ ^[0-9]+$ ]] || mtu=1500
+quantum=$(( (mtu + 14) * 2 ))
+initial_quantum=$(( (mtu + 14) * 10 ))
+if [[ "$scope" == "root" ]]; then
+target_limit=262144; target_flow=65536; target_buckets=16384
+else
+target_limit=32768; target_flow=2048; target_buckets=8192
+fi
+nettune_change_fq "$interface" "$scope" "$target_limit" "$target_flow" "$target_buckets" "$quantum" "$initial_quantum" || return 1
+done < "$NETTUNE_QDISC_VALUES_FILE"
+}
+
+nettune_restore_fq_profile() {
+[[ -s "$NETTUNE_QDISC_VALUES_FILE" ]] || return 0
+command -v tc >/dev/null 2>&1 || return 1
+local interface scope limit flow_limit buckets quantum initial_quantum failed=0
+while IFS=$'\t' read -r interface scope limit flow_limit buckets quantum initial_quantum; do
+[[ -n "$interface" && -n "$scope" ]] || continue
+nettune_change_fq "$interface" "$scope" "$limit" "$flow_limit" "$buckets" "$quantum" "$initial_quantum" || failed=1
+done < "$NETTUNE_QDISC_VALUES_FILE"
+(( failed == 0 ))
+}
+
+nettune_install_qdisc_unit() {
+if [[ ! -s "$NETTUNE_QDISC_VALUES_FILE" ]]; then
+rm -f -- "$NETTUNE_QDISC_UNIT"
+return 0
+fi
+mkdir -p "$(dirname "$NETTUNE_QDISC_UNIT")"
+cat > "$NETTUNE_QDISC_UNIT" <<EOF
+[Unit]
+Description=Tunnel Manager 1 Gbps fq queue profile
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${PANEL_PATH:-/usr/local/bin/backhaul} --qdisc-tune
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 644 "$NETTUNE_QDISC_UNIT"
+systemctl daemon-reload >/dev/null 2>&1 || return 1
+systemctl enable tunnel-manager-qdisc.service >/dev/null 2>&1 || return 1
+}
+
 # Capture the baseline only once. Re-applying optimization must never replace
 # the values needed for a real rollback with already-tuned values.
 nettune_capture_baseline() {
-[[ -f "$NETTUNE_VALUES_FILE" ]] && return 0
+if [[ -f "$NETTUNE_VALUES_FILE" ]]; then
+if [[ ! -f "$NETTUNE_QDISC_VALUES_FILE" ]]; then
+nettune_capture_fq_baseline || return 1
+fi
+if [[ ! -f "${NETTUNE_STATE_DIR}/qdisc-unit.exists" ]]; then
+nettune_snapshot_file "$NETTUNE_QDISC_UNIT" qdisc-unit || return 1
+fi
+return 0
+fi
 
 mkdir -p "$NETTUNE_STATE_DIR"
 chmod 700 "$NETTUNE_STATE_DIR"
 nettune_snapshot_file "$NETTUNE_SYSCTL_CONF" sysctl-conf || return 1
 nettune_snapshot_file "$NETTUNE_BBR_MODULE_CONF" bbr-module || return 1
 nettune_snapshot_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit || return 1
+nettune_snapshot_file "$NETTUNE_QDISC_UNIT" qdisc-unit || return 1
 nettune_snapshot_file "$NETTUNE_LIMITS_CONF" limits-conf || return 1
+nettune_capture_fq_baseline || return 1
 
 : > "$NETTUNE_VALUES_FILE"
 local key value
@@ -260,11 +374,11 @@ local memory_kb buffer_max tcp_buffer conntrack_max backlog
 memory_kb=$(awk '/^MemTotal:/ {print $2; exit}' "$NETTUNE_MEMINFO" 2>/dev/null)
 memory_kb=${memory_kb:-2097152}
 if (( memory_kb < 2097152 )); then
-buffer_max=16777216; tcp_buffer=8388608; conntrack_max=131072; backlog=10000
+buffer_max=33554432; tcp_buffer=16777216; conntrack_max=131072; backlog=16384
 elif (( memory_kb < 8388608 )); then
-buffer_max=33554432; tcp_buffer=16777216; conntrack_max=262144; backlog=20000
+buffer_max=67108864; tcp_buffer=33554432; conntrack_max=262144; backlog=32768
 else
-buffer_max=67108864; tcp_buffer=33554432; conntrack_max=524288; backlog=30000
+buffer_max=134217728; tcp_buffer=67108864; conntrack_max=524288; backlog=65536
 fi
 
 # Do not reduce a deliberately higher value already chosen by the admin.
@@ -344,11 +458,18 @@ colorize red "Could not activate the tuning file; restoring the saved state."
 core_optimize_rollback
 return 1
 fi
+if ! nettune_install_qdisc_unit || ! nettune_apply_fq_profile; then
+NETTUNE_LAST_ERROR="fq-qdisc-apply-failed"
+colorize red "Could not apply the 1 Gbps fq queue profile; restoring the saved state."
+core_optimize_rollback
+return 1
+fi
 # Fingerprint the files as written. Rollback uses these signatures to avoid
 # clobbering later administrator changes.
 if ! nettune_record_applied_file "$NETTUNE_SYSCTL_CONF" sysctl-conf ||
 ! nettune_record_applied_file "$NETTUNE_BBR_MODULE_CONF" bbr-module ||
-! nettune_record_applied_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit; then
+! nettune_record_applied_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit ||
+! nettune_record_applied_file "$NETTUNE_QDISC_UNIT" qdisc-unit; then
 colorize red "Could not record the applied file state; restoring the saved state."
 core_optimize_rollback
 return 1
@@ -370,13 +491,14 @@ colorize green "Network tuning applied. Original values are saved in: $NETTUNE_S
 echo "RAM profile:          $((memory_kb / 1024)) MB"
 echo "Congestion control:  $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
 echo "Default qdisc:       $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)"
+[[ -s "$NETTUNE_QDISC_VALUES_FILE" ]] && echo "Active fq profile:   1 Gbps (persisted across boot)"
 echo "Socket buffers:      rmem=${buffer_max}, wmem=${wmem_max}"
 echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null || echo n/a)"
 [[ "$conntrack_ok" == "1" ]] && echo "conntrack max:       $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
 [[ -n "$reserved_ports" ]] && echo "Reserved ports:      $reserved_ports"
 echo ""
 colorize yellow "Tunnel listeners sync automatically; re-run Optimize after adding external listeners."
-colorize yellow "No active qdisc, global PAM limit, or global systemd limit is modified."
+colorize yellow "Custom/non-fq qdiscs, global PAM limits, and global systemd limits are left untouched."
 }
 
 # Tunnel setup calls this before and after restarting a service: the first pass
@@ -409,8 +531,9 @@ return 1
 core_optimize_rollback() {
 if [[ ! -f "$NETTUNE_VALUES_FILE" ]]; then
 # Compatibility cleanup for installations optimized by an older release.
-if core_optimize_is_applied || [[ -f "$NETTUNE_BBR_MODULE_CONF" || -f "$NETTUNE_SYSTEMD_LIMIT_CONF" ]]; then
-rm -f -- "$NETTUNE_SYSCTL_CONF" "$NETTUNE_BBR_MODULE_CONF" "$NETTUNE_SYSTEMD_LIMIT_CONF"
+if core_optimize_is_applied || [[ -f "$NETTUNE_BBR_MODULE_CONF" || -f "$NETTUNE_SYSTEMD_LIMIT_CONF" || -f "$NETTUNE_QDISC_UNIT" ]]; then
+systemctl disable --now tunnel-manager-qdisc.service >/dev/null 2>&1 || true
+rm -f -- "$NETTUNE_SYSCTL_CONF" "$NETTUNE_BBR_MODULE_CONF" "$NETTUNE_SYSTEMD_LIMIT_CONF" "$NETTUNE_QDISC_UNIT"
 sed -i "/^# ${NETTUNE_LIMITS_TAG}$/,+4d" "$NETTUNE_LIMITS_CONF" 2>/dev/null || true
 sysctl --system >/dev/null 2>&1 || true
 systemctl daemon-reexec 2>/dev/null || true
@@ -422,10 +545,12 @@ return 0
 fi
 
 local restore_failed=0 restore_status restore_spec
+systemctl disable --now tunnel-manager-qdisc.service >/dev/null 2>&1 || true
 for restore_spec in \
 "$NETTUNE_SYSCTL_CONF|sysctl-conf" \
 "$NETTUNE_BBR_MODULE_CONF|bbr-module" \
-"$NETTUNE_SYSTEMD_LIMIT_CONF|systemd-limit"; do
+"$NETTUNE_SYSTEMD_LIMIT_CONF|systemd-limit" \
+"$NETTUNE_QDISC_UNIT|qdisc-unit"; do
 if nettune_restore_file_if_unchanged "${restore_spec%%|*}" "${restore_spec#*|}"; then
 restore_status=0
 else
@@ -433,6 +558,10 @@ restore_status=$?
 fi
 (( restore_status == 0 )) || restore_failed=1
 done
+if ! nettune_restore_fq_profile; then
+restore_failed=1
+colorize yellow "Could not restore one or more fq queue values."
+fi
 # limits.conf is a shared administrator-owned file. Older releases may have
 # placed one tagged block there, but rollback never replaces the whole file.
 sysctl --system >/dev/null 2>&1 || true

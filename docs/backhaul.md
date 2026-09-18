@@ -57,6 +57,8 @@ Open **Tunnel management**, select the IPX tunnel, then choose **Smart Auto-MTU*
 
 Best-in-panel for sustained TCP throughput on a clean link, especially with `tcpmux`/`wssmux` reducing per-connection overhead. TUN mode with the `iptables` forwarder adds the least overhead of the four forwarding engines; `haproxy` adds the most (but gives you backend health-checking in return).
 
+New TUN/IPX tunnels default to Backhaul's `fast` tuning profile with a `2048` packet batch. The panel chooses the listen address from the kernel route source rather than an external IP-check service, which is important on multi-IP servers where different prefixes can have very different international capacity. The OS buffer profile is sized so a clean link can sustain roughly 800 Mbps-1 Gbps at common international RTTs; congestion or provider shaping can still impose a lower ceiling.
+
 ## Security
 
 - Shared-token auth (`Security Token`, plain `tcp`/`ws` transports) or, in IPX mode, full encryption (AES-256-GCM by default, PSK + KDF iterations configurable).
@@ -76,7 +78,7 @@ Best-in-panel for sustained TCP throughput on a clean link, especially with `tcp
 
 ## Recommended configuration
 
-For a straightforward "expose these ports" tunnel on a clean link: `tcp` transport, `nodelay` on, default kernel tuning profile (`balanced`). For a link under light interference: `wss` transport with a realistic SNI. For anything needing UDP or a full port range: TUN mode with the `iptables` forwarder.
+For a straightforward "expose these ports" tunnel on a clean link: `tcp` transport, `nodelay` on, default kernel tuning profile (`balanced`). For a link under light interference: `wss` transport with a realistic SNI. For anything needing UDP or a full port range: TUN/IPX mode with the `iptables` forwarder; its default profile is `fast`.
 
 ## Menu path
 

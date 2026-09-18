@@ -6,6 +6,8 @@
 # touching this file. Requires lib/common.sh to already be sourced.
 
 VALID_ALGORITHMS=("aes-256-gcm" "chacha20-poly1305" "aes-128-gcm")
+BACKHAUL_WATCHDOG_FAILURE_LIMIT=3
+BACKHAUL_HEALTH_SAMPLE_INTERVAL=300
 # CONFIG must be associative: bare `CONFIG=()` makes it an indexed array, and
 # every non-numeric subscript (CONFIG[bind_addr], CONFIG[transport_type], ...)
 # then evaluates as an unset-variable arithmetic expression == 0, so every
@@ -427,7 +429,8 @@ esac
 ensure_watchdog_installed() {
 local unit_service="${service_dir}/backhaul-watchdog.service"
 local unit_timer="${service_dir}/backhaul-watchdog.timer"
-if [[ -f "$unit_timer" ]] && systemctl is-enabled --quiet backhaul-watchdog.timer 2>/dev/null; then
+if [[ -f "$unit_timer" ]] && grep -q '^OnUnitActiveSec=30s$' "$unit_timer" &&
+systemctl is-enabled --quiet backhaul-watchdog.timer 2>/dev/null; then
 return
 fi
 cat > "$unit_service" <<EOF
@@ -443,14 +446,69 @@ cat > "$unit_timer" <<EOF
 Description=Run Backhaul watchdog periodically
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
+}
+backhaul_watchdog_state_file() {
+local config_name="$1" suffix="$2"
+echo "${config_dir}/.watchdog/${config_name}.${suffix}"
+}
+backhaul_watchdog_reset_failures() {
+rm -f -- "$(backhaul_watchdog_state_file "$1" failures)"
+}
+backhaul_watchdog_path_ok() {
+local config_path="$1" tun_name="$2" remote mtu large_payload
+remote=$(toml_get "$config_path" "tun" "remote_addr")
+remote="${remote%/*}"
+[[ -n "$remote" && -n "$tun_name" ]] || return 1
+ping -I "$tun_name" -c 1 -W 2 -s 32 "$remote" >/dev/null 2>&1 && return 0
+mtu=$(toml_get "$config_path" "tun" "mtu")
+[[ "$mtu" =~ ^[0-9]+$ ]] || mtu=1320
+large_payload=$((mtu - 28))
+(( large_payload >= 32 )) || large_payload=32
+ping -I "$tun_name" -c 1 -W 2 -M "do" -s "$large_payload" "$remote" >/dev/null 2>&1
+}
+backhaul_watchdog_check_path() {
+local config_path="$1" config_name="$2" service_name="$3" tun_name="$4"
+local failure_file failures=0
+failure_file=$(backhaul_watchdog_state_file "$config_name" failures)
+if backhaul_watchdog_path_ok "$config_path" "$tun_name"; then
+backhaul_watchdog_reset_failures "$config_name"
+return 0
+fi
+mkdir -p "${config_dir}/.watchdog"
+[[ -f "$failure_file" ]] && read -r failures < "$failure_file"
+[[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+failures=$((failures + 1))
+printf '%s\n' "$failures" > "$failure_file"
+if (( failures < BACKHAUL_WATCHDOG_FAILURE_LIMIT )); then
+return 1
+fi
+logger -t backhaul-watchdog "${service_name} tunnel path failed ${failures} consecutive checks, restarting" 2>/dev/null
+systemctl restart "$service_name" >/dev/null 2>&1 || true
+backhaul_watchdog_reset_failures "$config_name"
+return 1
+}
+backhaul_watchdog_health_due() {
+local config_name="$1" stamp_file now last=0
+stamp_file=$(backhaul_watchdog_state_file "$config_name" health)
+now=$(date +%s)
+[[ -f "$stamp_file" ]] && read -r last < "$stamp_file"
+[[ "$last" =~ ^[0-9]+$ ]] || last=0
+if (( now - last < BACKHAUL_HEALTH_SAMPLE_INTERVAL )); then
+return 1
+fi
+mkdir -p "${config_dir}/.watchdog"
+printf '%s\n' "$now" > "$stamp_file"
+return 0
 }
 core_backhaul_watchdog_check_all() {
 local config_path config_name service_name is_tun is_ipx tun_name
@@ -465,6 +523,7 @@ is_ipx="false"; tunnel_is_ipx "$config_path" && is_ipx="true"
 if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
 [[ "$is_ipx" == "true" ]] && tunnel_health_run "$config_path" watchdog || true
 watchdog_restart_if_enabled "$service_name" "backhaul-watchdog"
+backhaul_watchdog_reset_failures "$config_name"
 continue
 fi
 is_tun="false"; tunnel_is_tun "$config_path" && is_tun="true"
@@ -474,11 +533,15 @@ if [[ -n "$tun_name" ]] && ! tun_iface_exists "$tun_name"; then
 [[ "$is_ipx" == "true" ]] && tunnel_health_run "$config_path" watchdog || true
 logger -t backhaul-watchdog "${service_name} TUN interface ${tun_name} is down, restarting" 2>/dev/null
 systemctl restart "$service_name" 2>/dev/null
+backhaul_watchdog_reset_failures "$config_name"
 continue
 fi
 if [[ "$is_ipx" == "true" ]]; then
+backhaul_watchdog_check_path "$config_path" "$config_name" "$service_name" "$tun_name" || true
+if backhaul_watchdog_health_due "$config_name"; then
 tunnel_health_run "$config_path" watchdog || true
 automtu_run "$config_path" watchdog || true
+fi
 fi
 fi
 done
@@ -912,7 +975,15 @@ prompt_with_default "Connection Pool" "${CONFIG[connection_pool]:-8}" CONFIG[con
 fi
 fi
 CONFIG[heartbeat_interval]="10"
+if [[ "$is_ipx" == "true" ]]; then
+# IPX traffic can remain usable while its built-in heartbeat is delayed on a
+# congested route. The external watchdog performs a three-sample TUN-path
+# check, so a long native timeout avoids false reconnect loops without hiding
+# a genuinely dead tunnel.
+CONFIG[heartbeat_timeout]="604800"
+else
 CONFIG[heartbeat_timeout]="25"
+fi
 if [[ "$is_ipx" != "true" ]]; then
 CONFIG[keepalive_period]="40"
 fi
@@ -1059,7 +1130,9 @@ colorize blue "━━━ Tuning Configuration ━━━" bold
 prompt_boolean "Enable Auto Tuning" "${CONFIG[auto_tuning]:-true}" CONFIG[auto_tuning]
 echo
 colorize magenta "Profiles: balanced, fast, latency, resource" normal
-prompt_with_default "Kernel Tuning Profile" "${CONFIG[tuning_profile]:-balanced}" CONFIG[tuning_profile]
+local default_tuning_profile="balanced"
+[[ "$is_tun" == "true" ]] && default_tuning_profile="fast"
+prompt_with_default "Kernel Tuning Profile" "${CONFIG[tuning_profile]:-$default_tuning_profile}" CONFIG[tuning_profile]
 prompt_with_default "Workers (0 = auto)" "${CONFIG[workers]:-0}" CONFIG[workers]
 if [[ "$is_tun" != "true" ]]; then
 prompt_with_default "Channel Size" "${CONFIG[channel_size]:-4096}" CONFIG[channel_size]
@@ -1168,7 +1241,19 @@ colorize red "Invalid profile: ${CONFIG[ipx_profile]}"
 echo
 colorize yellow "Please choose one of: ${AVAILABLE_PROFILES[*]}"
 done
-prompt_with_default "Listen IP" "${CONFIG[ipx_listen_ip]:-${PUBLIC_IPV4:-$SERVER_IP}}" CONFIG[ipx_listen_ip]
+local interface route_source listen_default
+interface="${CONFIG[ipx_interface]:-$(detect_default_interface)}"
+prompt_with_default "Network Interface" "$interface" CONFIG[ipx_interface]
+route_source=$(detect_route_source_ipv4 "${CONFIG[ipx_interface]}" 2>/dev/null || true)
+listen_default="${CONFIG[ipx_listen_ip]:-${route_source:-${SERVER_IP:-${PUBLIC_IPV4:-}}}}"
+while true; do
+prompt_with_default "Listen IP" "$listen_default" CONFIG[ipx_listen_ip]
+if ipv4_is_local_on_interface "${CONFIG[ipx_listen_ip]}" "${CONFIG[ipx_interface]}"; then
+break
+fi
+colorize red "Listen IP must be assigned to ${CONFIG[ipx_interface]}."
+colorize yellow "The route-source address (${route_source:-unknown}) is normally the correct choice on multi-IP servers."
+done
 while :; do
 prompt_with_default "Destination IP" "${CONFIG[ipx_dst_ip]:-$(get_last_used "peer_ip" "")}" CONFIG[ipx_dst_ip]
 if [[ -n "${CONFIG[ipx_dst_ip]}" ]]; then
@@ -1176,9 +1261,6 @@ break
 fi
 colorize red "Destination IP cannot be empty."
 done
-local interface
-interface="${CONFIG[ipx_interface]:-$(detect_default_interface)}"
-prompt_with_default "Network Interface" "$interface" CONFIG[ipx_interface]
 if [[ "${CONFIG[ipx_profile]}" == "icmp" ]]; then
 prompt_with_default "ICMP Type" "${CONFIG[ipx_icmp_type]:-0}" CONFIG[ipx_icmp_type]
 prompt_with_default "ICMP Code" "${CONFIG[ipx_icmp_code]:-0}" CONFIG[ipx_icmp_code]
@@ -2299,6 +2381,7 @@ removed_mapping=$(load_toml_ports_mapping "$config_path")
 removed_tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
 automtu_delete_state "$config_name" 2>/dev/null || true
 tunnel_health_delete "$config_name" 2>/dev/null || true
+rm -f -- "$(backhaul_watchdog_state_file "$config_name" failures)" "$(backhaul_watchdog_state_file "$config_name" health)"
 tm_firewall_close_owner "backhaul:${config_name}"
 tm_firewall_close_owner "backhaul:${config_name}:control"
 if [[ -n "$removed_forwarder" && "$removed_forwarder" != "backhaul" ]]; then
@@ -2376,6 +2459,12 @@ core_backhaul_ensure_ready() {
 install_jq
 download_and_extract_backhaul "install"
 check_config_backup
+if [[ "${SCRIPT_MODE:-}" != "--watchdog" ]] && {
+compgen -G "${config_dir}/iran*.toml" >/dev/null ||
+compgen -G "${config_dir}/kharej*.toml" >/dev/null
+}; then
+ensure_watchdog_installed
+fi
 }
 core_backhaul_configure() {
 [[ ! -d "$config_dir" ]] && {

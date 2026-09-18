@@ -5,7 +5,7 @@
 # pre-refactor script. Adding a new core (FRP, TUIC, ...) means writing
 # core/<name>/core.sh and wiring it in four places — see core/README.md for
 # the full plugin interface contract and a step-by-step checklist.
-SCRIPT_VERSION="v2.4.1"
+SCRIPT_VERSION="v2.5.0"
 SCRIPT_MODE="$1"
 INSTALL_DIR="/opt/tunnel-manager"
 PANEL_PATH="/usr/local/bin/backhaul"
@@ -47,6 +47,11 @@ source "${INSTALL_DIR}/core/hysteria2/core.sh"
 source "${INSTALL_DIR}/core/frp/core.sh"
 # shellcheck source=core/tuic/core.sh
 source "${INSTALL_DIR}/core/tuic/core.sh"
+
+if [[ "$SCRIPT_MODE" == "--qdisc-tune" ]]; then
+nettune_apply_fq_profile
+exit $?
+fi
 
 emit_metrics_json() {
 local hostname cpu mem_used mem_total mem_pct iface rx tx
@@ -94,7 +99,7 @@ fi
 
 PUBLIC_IPV4=$(detect_public_ipv4)
 PUBLIC_IPV6=$(detect_public_ipv6)
-SERVER_IP=$(hostname -I | awk '{print $1}')
+SERVER_IP=$(detect_route_source_ipv4 2>/dev/null || hostname -I | awk '{print $1}')
 SERVER_GEO=$(curl -fsS --proto '=https' --tlsv1.2 --max-time 2 "https://ipwhois.app/json/${PUBLIC_IPV4}" 2>/dev/null || true)
 SERVER_COUNTRY=$(jq -r '.country // empty' <<< "$SERVER_GEO" 2>/dev/null)
 SERVER_ISP=$(jq -r '.isp // empty' <<< "$SERVER_GEO" 2>/dev/null)
@@ -116,7 +121,7 @@ core_backhaul_ensure_ready
 # Backhaul only does for server-mode tunnels on wss/anytls/wssmux transports,
 # and only when the user kept the default cert path (a customized path means
 # it isn't ours to rotate, so it's deliberately left alone). Checked on every
-# watchdog run (every 5 minutes via the timer). New certificates are long-lived
+# watchdog run (every 30 seconds via the timer). New certificates are long-lived
 # because Hysteria pins their exact fingerprint and TUIC trusts the copied
 # certificate; needless early rotation would break those remote clients.
 watchdog_renew_shared_cert() {

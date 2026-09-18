@@ -143,6 +143,26 @@ iface=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="
 fi
 echo "$iface"
 }
+detect_route_source_ipv4() {
+local interface="${1:-}" route source_ip
+if [[ -n "$interface" ]]; then
+route=$(ip -4 route get 1.1.1.1 oif "$interface" 2>/dev/null | head -1)
+else
+route=$(ip -4 route get 1.1.1.1 2>/dev/null | head -1)
+fi
+source_ip=$(awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' <<< "$route")
+if [[ "$source_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+echo "$source_ip"
+return 0
+fi
+return 1
+}
+ipv4_is_local_on_interface() {
+local address="$1" interface="$2"
+[[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && -n "$interface" ]] || return 1
+ip -o -4 addr show dev "$interface" 2>/dev/null |
+awk '{print $4}' | cut -d/ -f1 | grep -Fxq -- "$address"
+}
 detect_public_ipv4() {
 local ip
 for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
